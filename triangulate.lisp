@@ -5,9 +5,16 @@
   x
   y)
 
+(defun vertex= (a b)
+  (check-type a vertex)
+  (check-type b vertex)
+  (and (= (x a) (x b))
+       (= (y a) (y b))))
+
 (defstruct (node (:constructor %make-node))
   "An element in a double-linked circular VERTEX list."
   vertex
+  (ear-p nil)
   (next nil)
   (prev nil))
 
@@ -41,19 +48,36 @@ This destructively updates NODE's links."
       (insert-prev! v head))
     (make-polygon :head head)))
 
+
+(defmacro dopolygon ((var polygon-form &optional result-form)
+                     &body body)
+  "Iterate over the nodes of a polygon. Like DOLIST."
+  (check-type var symbol)
+  (let ((node (gensym "node"))
+        (poly-head (gensym "node")))
+    `(let ((,poly-head (polygon-head ,polygon-form))
+           (,var nil))
+       (loop :for ,node := ,poly-head :then (node-next ,node)
+             :do (progn
+                   (setf ,var ,node)
+                   ,@body)
+             :until (eq (node-next ,node) ,poly-head))
+       ,result-form)))
+
+
 (defun vertex-list (polygon)
   "Get the list of VERTICES associated with POLYGON, traversed in counter-clockwise order."
   (if polygon
-      (loop :for v := (polygon-head polygon) :then (node-next v)
-            :collect (node-vertex v)
-            :until (eq (node-next v) (polygon-head polygon)))
+      (let ((verts nil))
+        (dopolygon (nv polygon (nreverse verts))
+          (push (node-vertex nv) verts)))
       nil))
 
 (defun num-vertices (polygon)
   "The number of vertices in POLYGON."
-  (loop :for v := (polygon-head polygon) :then (node-next v)
-        :count :it
-        :until (eq (polygon-head polygon) (node-next v))))
+  (let ((count 0))
+    (dopolygon (nv polygon count)
+      (incf count))))
 
 (defun area2 (a b c)
   "Compute twice the (signed) area of the triangle with vertices A,B,C."
@@ -72,6 +96,13 @@ This destructively updates NODE's links."
                     (node-vertex nnv))
         :until (eq (polygon-head polygon) (node-next nnv))))
 
+(defun nth-node (n polygon)
+  "Get the Nth node of POLYGON."
+  (check-type n integer)
+  (let ((step-fn (if (plusp n) #'node-next #'node-prev)))
+    (let ((nv (polygon-head polygon)))
+      (dotimes (i (abs n) nv)
+        (setf nv (funcall step-fn nv))))))
 
 ;;; Segment Intersexction
 
@@ -124,3 +155,90 @@ This is with respect to the orientation induced by traversing AB from A to B."
       (between-p a b d)
       (between-p c d a)
       (between-p c d b)))
+
+;;; TODO: write DOVERTICES, DOEDGE instead of DOPOLYGON
+
+;;; TODO: this fails on some wacky degenerate cases. also, we check more edges than necessary
+(defun simple-p (polygon)
+  (dopolygon (nv polygon t)
+    ;; basic idea: each edge in a simple polygon intersects 2 others.
+    (let ((hit-count 0))
+      (dopolygon (ne polygon)
+        (when (intersects-p (node-vertex nv) (node-vertex (node-next nv))
+                            (node-vertex ne) (node-vertex (node-next ne)))
+          (incf hit-count)
+          (when (> hit-count 3)         ; 3 since the edge trivially intersects itself
+            (return-from simple-p nil)))))))
+
+;;; Triangulation Routines
+
+;;; TODO: adopt convention that a,b,c vertices, na,nb,nc nodes
+
+(defun in-cone-p (na b)
+  "Given a node NA, determine whether the directed segment from A to B lies within the cone at NA."
+  (check-type na node)
+  (check-type b vertex)
+  (let ((a- (node-vertex (node-prev na)))
+        (a  (node-vertex na))
+        (a+ (node-vertex (node-next na))))
+    (if (left-on-p a a+ a-)
+        ;; a-,a,a+ has angle <= pi radians
+        (and (left-p a b a-)
+             (left-p b a a+))
+        ;; a-,a,a+ has angle > pi radians
+        (not (and (left-on-p a b a+)
+                  (left-on-p b a a-))))))
+
+(defun diagonal-p (na nb)
+  "Determine whether two nodes NA and NB form a diagonal segment AB of POLYGON."
+  ;; NOTE: It is assumed that NA and NB are actually nodes of POYLYGON!
+  (check-type na node)
+  (check-type nb node)
+  ;; Check: is the segment AB locally interior to POLYGON at A,B?
+  (unless (and (in-cone-p na (node-vertex nb))
+               (in-cone-p nb (node-vertex na)))
+    (return-from diagonal-p nil))
+
+  ;; Ok, walk edges and check for nontrivial intersections
+  (dopolygon (nv (make-polygon :head na) t)
+    (let ((nv+ (node-next nv)))
+      (when (and (not (eq na nv)) (not (eq na nv+))
+                 (not (eq nb nv)) (not (eq nb nv+))
+                 (intersects-p (node-vertex na) (node-vertex nb)
+                               (node-vertex nv) (node-vertex nv+)))
+        (return-from diagonal-p nil)))))
+
+
+(defun set-ears! (polygon)
+  "Set the EAR-P flag on nodes in POLYGON to T if the node represents an ear.
+
+Here 'ear' means that the node's immediate neighbors form a diagonal of the polygon."
+  (dopolygon (nv polygon)
+    (setf (node-ear-p nv) (diagonal-p (node-prev nv)
+                                      (node-next nv)))))
+
+(defun trim-ear! (nv)
+  (let ((nv- (node-prev nv))
+        (nv+ (node-next nv)))
+    (setf (node-ear-p nv-) (diagonal-p (node-prev nv-) nv+))
+    (setf (node-ear-p nv+) (diagonal-p nv- (node-next nv+)))
+    (setf (node-next nv-) nv+)
+    (setf (node-prev nv+) nv-)))
+
+(defun triangulation (polygon)
+  (let ((copy (apply #'polygon (vertex-list polygon))))
+    (set-ears! copy)
+    (let ((edges nil))
+      (loop :for n :downfrom (num-vertices copy) :above 3
+            :do
+               (loop :for nv := (polygon-head copy) :then nv+
+                     :for nv- := (node-prev nv)
+                     :for nv+ := (node-next nv)
+                     :when (node-ear-p nv)
+                       :do (progn
+                             (push (cons (node-vertex nv-) (node-vertex nv+)) edges)
+                             (trim-ear! nv)
+                             (setf (polygon-head copy) nv+) ; in case head is nv
+                             )
+                     :until (node-ear-p nv)))
+      edges)))
